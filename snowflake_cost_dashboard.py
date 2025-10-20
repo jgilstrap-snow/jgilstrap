@@ -1060,7 +1060,10 @@ class StorageAnalyzer(ServiceAnalyzer):
     
     def get_base_query(self, view_type: ViewType) -> str:
         """
-        Generate account-level storage usage query.
+        Generate account-level storage usage query using DATABASE_STORAGE_USAGE_HISTORY.
+        
+        This view provides more accurate database-level storage that is aggregated to account level.
+        Includes database storage, failsafe storage, and stage storage.
         
         Args:
             view_type (ViewType): Ignored - always account level
@@ -1069,24 +1072,43 @@ class StorageAnalyzer(ServiceAnalyzer):
             str: SQL query for account-level storage data
         """
         return """
+        WITH database_storage AS (
+            -- Aggregate all database storage by date (including deleted databases for historical accuracy)
+            -- No date filter to show all available history (Snowflake retains 1 year of data)
+            SELECT 
+                USAGE_DATE,
+                SUM(AVERAGE_DATABASE_BYTES) as STORAGE_BYTES,
+                SUM(AVERAGE_FAILSAFE_BYTES) as FAILSAFE_BYTES
+            FROM SNOWFLAKE.ACCOUNT_USAGE.DATABASE_STORAGE_USAGE_HISTORY
+            GROUP BY USAGE_DATE
+        ),
+        stage_storage AS (
+            -- Get stage storage separately
+            -- No date filter to show all available history (Snowflake retains 1 year of data)
+            SELECT 
+                USAGE_DATE,
+                SUM(AVERAGE_STAGE_BYTES) as STAGE_BYTES
+            FROM SNOWFLAKE.ACCOUNT_USAGE.STAGE_STORAGE_USAGE_HISTORY
+            GROUP BY USAGE_DATE
+        )
         SELECT 
-            USAGE_DATE,
-            STORAGE_BYTES,
-            STAGE_BYTES,
-            FAILSAFE_BYTES,
+            COALESCE(d.USAGE_DATE, s.USAGE_DATE) as USAGE_DATE,
+            COALESCE(d.STORAGE_BYTES, 0) as STORAGE_BYTES,
+            COALESCE(s.STAGE_BYTES, 0) as STAGE_BYTES,
+            COALESCE(d.FAILSAFE_BYTES, 0) as FAILSAFE_BYTES,
             -- Convert bytes to GB for easier reading
-            STORAGE_BYTES / (1024.0 * 1024.0 * 1024.0) as STORAGE_GB,
-            STAGE_BYTES / (1024.0 * 1024.0 * 1024.0) as STAGE_GB,
-            FAILSAFE_BYTES / (1024.0 * 1024.0 * 1024.0) as FAILSAFE_GB,
-            -- Convert bytes to approximate credits
-            (STORAGE_BYTES / (1024.0 * 1024.0 * 1024.0)) * 0.00005479 as STORAGE_CREDITS,
-            (STAGE_BYTES / (1024.0 * 1024.0 * 1024.0)) * 0.00005479 as STAGE_CREDITS,
-            (FAILSAFE_BYTES / (1024.0 * 1024.0 * 1024.0)) * 0.00005479 as FAILSAFE_CREDITS,
+            COALESCE(d.STORAGE_BYTES, 0) / (1024.0 * 1024.0 * 1024.0) as STORAGE_GB,
+            COALESCE(s.STAGE_BYTES, 0) / (1024.0 * 1024.0 * 1024.0) as STAGE_GB,
+            COALESCE(d.FAILSAFE_BYTES, 0) / (1024.0 * 1024.0 * 1024.0) as FAILSAFE_GB,
+            -- Convert bytes to approximate credits (rate may vary by region)
+            (COALESCE(d.STORAGE_BYTES, 0) / (1024.0 * 1024.0 * 1024.0)) * 0.00005479 as STORAGE_CREDITS,
+            (COALESCE(s.STAGE_BYTES, 0) / (1024.0 * 1024.0 * 1024.0)) * 0.00005479 as STAGE_CREDITS,
+            (COALESCE(d.FAILSAFE_BYTES, 0) / (1024.0 * 1024.0 * 1024.0)) * 0.00005479 as FAILSAFE_CREDITS,
             -- Total storage
-            (STORAGE_BYTES + STAGE_BYTES + FAILSAFE_BYTES) / (1024.0 * 1024.0 * 1024.0) as TOTAL_STORAGE_GB,
-            ((STORAGE_BYTES + STAGE_BYTES + FAILSAFE_BYTES) / (1024.0 * 1024.0 * 1024.0)) * 0.00005479 as TOTAL_CREDITS
-        FROM SNOWFLAKE.ACCOUNT_USAGE.STORAGE_USAGE
-        WHERE USAGE_DATE >= DATEADD('month', -12, CURRENT_DATE())
+            (COALESCE(d.STORAGE_BYTES, 0) + COALESCE(s.STAGE_BYTES, 0) + COALESCE(d.FAILSAFE_BYTES, 0)) / (1024.0 * 1024.0 * 1024.0) as TOTAL_STORAGE_GB,
+            ((COALESCE(d.STORAGE_BYTES, 0) + COALESCE(s.STAGE_BYTES, 0) + COALESCE(d.FAILSAFE_BYTES, 0)) / (1024.0 * 1024.0 * 1024.0)) * 0.00005479 as TOTAL_CREDITS
+        FROM database_storage d
+        FULL OUTER JOIN stage_storage s ON d.USAGE_DATE = s.USAGE_DATE
         ORDER BY USAGE_DATE DESC
         """
     
@@ -4408,690 +4430,1103 @@ class ClientConsumptionAnalyzer(ServiceAnalyzer):
         pass
 
 
-class ComprehensiveAIServicesAnalyzer:
+class AIServicesAnalyzer:
     """
-    Comprehensive analyzer for all Snowflake Cortex AI services using all available ACCOUNT_USAGE views.
-    Provides detailed analysis of Cortex Analyst, Document Processing, Fine-tuning, Functions, 
-    Provisioned Throughput, and Search services.
+    Simplified analyzer for Snowflake AI Services usage and costs.
+    
+    Provides clear, accurate analysis of AI service consumption across six service types:
+    - Account-Level AI Services (from METERING_DAILY_HISTORY)
+    - Cortex Functions
+    - Cortex Analyst
+    - Cortex Search
+    - Document AI
+    - Fine-Tuning
+    
+    Each service is analyzed independently with simplified visualizations to prevent
+    duplicate credit counting and enable easy validation.
     """
     
     def __init__(self, data_manager):
-        """Initialize the comprehensive AI Services analyzer."""
+        """
+        Initialize AI Services analyzer.
+        
+        Args:
+            data_manager: Instance of DataAccessManager for query execution
+        """
         self.data_manager = data_manager
         self.service_name = "AI Services"
-        
-        # Define all Cortex ACCOUNT_USAGE views
-        self.cortex_views = {
-            'CORTEX_ANALYST_USAGE_HISTORY': 'Cortex Analyst',
-            'CORTEX_DOCUMENT_PROCESSING_USAGE_HISTORY': 'Document Processing', 
-            'CORTEX_FINE_TUNING_USAGE_HISTORY': 'Fine-tuning',
-            'CORTEX_FUNCTIONS_QUERY_USAGE_HISTORY': 'Functions Query',
-            'CORTEX_FUNCTIONS_USAGE_HISTORY': 'Functions Usage',
-            'CORTEX_PROVISIONED_THROUGHPUT_USAGE_HISTORY': 'Provisioned Throughput',
-            'CORTEX_SEARCH_DAILY_USAGE_HISTORY': 'Search Daily',
-            'CORTEX_SEARCH_SERVING_USAGE_HISTORY': 'Search Serving'
-        }
     
     def render_analysis(self) -> None:
         """
-        Render comprehensive AI services analysis using all Cortex ACCOUNT_USAGE views.
+        Render comprehensive AI services analysis with all service types.
+        
+        Orchestrates the display of all AI service sections in a logical order:
+        1. Account-Level Summary
+        2. Cortex Functions
+        3. Cortex Analyst
+        4. Cortex Search
+        5. Document AI
+        6. Fine-Tuning
+        
+        Each section is independent to prevent duplicate credit counting.
+        Sections with no data will display informative messages.
         """
-        st.markdown("### 🤖 Comprehensive AI Services Analysis")
-        st.markdown("Complete analysis of all Snowflake Cortex AI services using ACCOUNT_USAGE views.")
+        st.markdown("### 🤖 AI Services Analysis")
+        st.markdown("Comprehensive analysis of Snowflake AI services usage and costs.")
         
-        # Get comprehensive AI services data
-        ai_data = self._get_comprehensive_cortex_data()
+        # Track if any data exists
+        has_any_data = False
         
-        if ai_data is None or ai_data.empty:
-            self._render_no_data_guidance()
-            return
-        
-        # Render comprehensive analysis
-        self._render_overall_summary(ai_data)
-        self._render_service_breakdowns(ai_data)
-        self._render_optimization_insights(ai_data)
-    
-    def _get_comprehensive_cortex_data(self) -> Optional[pd.DataFrame]:
-        """
-        Query all Cortex ACCOUNT_USAGE views and combine results.
-        
-        Returns:
-            Optional[pd.DataFrame]: Combined Cortex services data
-        """
-        
-        all_results = []
-        available_views = []
-        
-        # Query each Cortex view directly (no redundant test queries)
-        for view_name, service_type in self.cortex_views.items():
-            try:
-                # Get data directly - this will handle view existence checking
-                data_result = self._query_cortex_view(view_name, service_type)
-                if data_result is not None and not data_result.empty:
-                    available_views.append((view_name, service_type))
-                    all_results.append(data_result)
-                    
-            except Exception as e:
-                pass  # Silently skip unavailable views
-        
-        # Return None if no views are available
-        if not available_views:
-            return None
-        
-        # Combine all results
-        if all_results:
-            combined_data = pd.concat(all_results, ignore_index=True)
-            
-            # Ensure consistent datetime types to avoid comparison errors
-            try:
-                # Convert to datetime and remove timezone info to avoid tz-aware/tz-naive conflicts
-                combined_data['START_TIME'] = pd.to_datetime(combined_data['START_TIME']).dt.tz_localize(None)
-                combined_data['USAGE_MONTH'] = pd.to_datetime(combined_data['USAGE_MONTH']).dt.tz_localize(None)
-                combined_data = combined_data.sort_values('START_TIME', ascending=False)
-            except Exception as e:
-                # Try without sorting if date conversion fails
-                pass
-            
-            return combined_data
+        # 1. Account-Level AI Services
+        account_data = self._get_account_level_data()
+        if account_data is not None and not account_data.empty:
+            self._render_account_level_section(account_data)
+            has_any_data = True
         else:
-            return None
-    
-    def _query_cortex_view(self, view_name: str, service_type: str) -> Optional[pd.DataFrame]:
-        """
-        Query a specific Cortex view with dynamic column detection and mapping.
+            self._handle_no_data("Account-Level AI Services")
         
-        Args:
-            view_name (str): Name of the Cortex ACCOUNT_USAGE view
-            service_type (str): Human-readable service type name
-            
-        Returns:
-            Optional[pd.DataFrame]: Standardized data from the view
+        # 2. Cortex Functions
+        functions_data = self._get_cortex_functions_data()
+        if functions_data is not None and not functions_data.empty:
+            self._render_cortex_functions_section(functions_data)
+            has_any_data = True
+        else:
+            self._handle_no_data("Cortex Functions")
+        
+        # 3. Cortex Analyst
+        analyst_data = self._get_cortex_analyst_data()
+        if analyst_data is not None and not analyst_data.empty:
+            self._render_cortex_analyst_section(analyst_data)
+            has_any_data = True
+        else:
+            self._handle_no_data("Cortex Analyst")
+        
+        # 4. Cortex Search
+        search_data = self._get_cortex_search_data()
+        if search_data is not None and not search_data.empty:
+            self._render_cortex_search_section(search_data)
+            has_any_data = True
+        else:
+            self._handle_no_data("Cortex Search")
+        
+        # 5. Document AI
+        document_data = self._get_document_ai_data()
+        if document_data is not None and not document_data.empty:
+            self._render_document_ai_section(document_data)
+            has_any_data = True
+        else:
+            self._handle_no_data("Document AI")
+        
+        # 6. Fine-Tuning
+        tuning_data = self._get_fine_tuning_data()
+        if tuning_data is not None and not tuning_data.empty:
+            self._render_fine_tuning_section(tuning_data)
+            has_any_data = True
+        else:
+            self._handle_no_data("Fine-Tuning")
+        
+        # Display guidance if no AI services have any data
+        if not has_any_data:
+            st.markdown("---")
+            st.info("""
+                💡 **No AI Services usage detected**
+                
+                This could mean:
+                - AI Services have not been used in the last 12 months
+                - The ACCOUNT_USAGE views may not have data yet (latency up to 45 minutes)
+                - The current role may not have access to ACCOUNT_USAGE views
+                
+                To use AI Services:
+                - Try Cortex Functions: `SELECT SNOWFLAKE.CORTEX.COMPLETE('llama2-70b-chat', 'Hello!')`
+                - Set up Cortex Search for semantic search capabilities
+                - Use Cortex Analyst for natural language data analysis
+            """)
+    
+    def _get_account_level_data(self) -> Optional[pd.DataFrame]:
         """
+        Retrieve account-level AI services usage data from METERING_DAILY_HISTORY.
+        
+        Queries SNOWFLAKE.ACCOUNT_USAGE.METERING_DAILY_HISTORY filtered by SERVICE_TYPE='AI_SERVICES'
+        to get overall AI services credit consumption at the account level.
+        
+        Test Query:
+        SELECT 
+            SERVICE_TYPE,
+            USAGE_DATE,
+            CREDITS_USED
+        FROM SNOWFLAKE.ACCOUNT_USAGE.METERING_DAILY_HISTORY
+        WHERE SERVICE_TYPE = 'AI_SERVICES'
+            AND USAGE_DATE >= DATEADD('month', -12, CURRENT_DATE())
+        ORDER BY USAGE_DATE DESC;
+        
+        Returns:
+            Optional[pd.DataFrame]: DataFrame with columns SERVICE_TYPE, USAGE_DATE, CREDITS_USED,
+                                   or None if query fails or no data exists
+        """
+        query = """
+        SELECT 
+            SERVICE_TYPE,
+            USAGE_DATE,
+            CREDITS_USED
+        FROM SNOWFLAKE.ACCOUNT_USAGE.METERING_DAILY_HISTORY
+        WHERE SERVICE_TYPE = 'AI_SERVICES'
+            AND USAGE_DATE >= DATEADD('month', -12, CURRENT_DATE())
+        ORDER BY USAGE_DATE DESC
+        """
+        
         try:
-            # First, get the actual column names from the view
-            columns_query = f"""
-            SELECT * 
-            FROM SNOWFLAKE.ACCOUNT_USAGE.{view_name} 
-            LIMIT 1
-            """
+            data = self.data_manager.execute_query(query)
             
-            sample_result = self.data_manager.execute_query(columns_query)
-            if sample_result is None:
+            if data is None or data.empty:
                 return None
             
-            available_columns = sample_result.columns.tolist()
+            # Handle NULL credits (convert to 0)
+            if 'CREDITS_USED' in data.columns:
+                data['CREDITS_USED'] = data['CREDITS_USED'].fillna(0)
             
-            # Use view-specific query logic based on the actual schema
-            if view_name == 'CORTEX_FUNCTIONS_QUERY_USAGE_HISTORY':
-                return self._query_functions_query_usage(view_name, service_type, available_columns)
-            elif view_name == 'CORTEX_FUNCTIONS_USAGE_HISTORY':
-                return self._query_functions_usage(view_name, service_type, available_columns)
-            elif view_name == 'CORTEX_PROVISIONED_THROUGHPUT_USAGE_HISTORY':
-                return self._query_provisioned_throughput_usage(view_name, service_type, available_columns)
-            elif view_name == 'CORTEX_SEARCH_DAILY_USAGE_HISTORY':
-                return self._query_search_daily_usage(view_name, service_type, available_columns)
-            else:
-                return self._query_standard_cortex_view(view_name, service_type, available_columns)
+            # Handle timezone normalization for dates
+            if 'USAGE_DATE' in data.columns:
+                data['USAGE_DATE'] = pd.to_datetime(data['USAGE_DATE']).dt.tz_localize(None)
+            
+            return data
             
         except Exception as e:
+            st.error(f"Error querying Account-Level AI Services data: {str(e)}")
             return None
     
-    def _query_functions_query_usage(self, view_name: str, service_type: str, columns: list) -> Optional[pd.DataFrame]:
+    def _render_account_level_section(self, data: pd.DataFrame) -> None:
         """
-        Query CORTEX_FUNCTIONS_QUERY_USAGE_HISTORY which has a different schema (no START_TIME).
+        Render account-level AI services summary section with metrics, trends, and data table.
         
-        Based on documentation: QUERY_ID, WAREHOUSE_ID, MODEL_NAME, FUNCTION_NAME, TOKENS, TOKEN_CREDITS
-        """
-        try:
-            # This view doesn't have START_TIME, so we need to get it from QUERY_HISTORY
-            query = f"""
-            SELECT 
-                CURRENT_DATE() as START_TIME,
-                DATE_TRUNC('month', CURRENT_DATE()) as USAGE_MONTH,
-                '{service_type}' as AI_SERVICE_TYPE,
-                COALESCE(TOKEN_CREDITS, 0) as CREDITS_USED,
-                COALESCE(TOKEN_CREDITS, 0) as TOTAL_CREDITS,
-                1 as REQUEST_COUNT,
-                COALESCE(TOKENS, 0) as TOKEN_COUNT,
-                COALESCE(MODEL_NAME, FUNCTION_NAME, 'Unknown') as SERVICE_DETAIL,
-                QUERY_ID
-            FROM SNOWFLAKE.ACCOUNT_USAGE.{view_name}
-            LIMIT 1000
-            """
-            
-            result = self.data_manager.execute_query(query)
-            if result is not None and not result.empty:
-                # Ensure consistent datetime types (timezone-naive)
-                result['START_TIME'] = pd.to_datetime(result['START_TIME']).dt.tz_localize(None)
-                result['USAGE_MONTH'] = pd.to_datetime(result['USAGE_MONTH']).dt.tz_localize(None)
-            return result
-            
-        except Exception as e:
-            return None
-    
-    def _query_functions_usage(self, view_name: str, service_type: str, columns: list) -> Optional[pd.DataFrame]:
-        """
-        Query CORTEX_FUNCTIONS_USAGE_HISTORY which should have START_TIME.
-        """
-        try:
-            # Build dynamic column mapping
-            credits_col = self._find_credits_column(columns)
-            request_col = self._find_request_column(columns)
-            token_col = self._find_token_column(columns)
-            detail_col = self._find_detail_column(columns)
-            
-            # Check if START_TIME exists
-            time_col = 'START_TIME' if 'START_TIME' in columns else 'CURRENT_DATE()'
-            
-            query = f"""
-            SELECT 
-                {time_col} as START_TIME,
-                DATE_TRUNC('month', {time_col}) as USAGE_MONTH,
-                '{service_type}' as AI_SERVICE_TYPE,
-                {credits_col} as CREDITS_USED,
-                {credits_col} as TOTAL_CREDITS,
-                {request_col} as REQUEST_COUNT,
-                {token_col} as TOKEN_COUNT,
-                {detail_col} as SERVICE_DETAIL
-            FROM SNOWFLAKE.ACCOUNT_USAGE.{view_name}
-            WHERE {time_col} >= DATEADD('month', -12, CURRENT_DATE())
-            ORDER BY {time_col} DESC
-            LIMIT 1000
-            """
-            
-            result = self.data_manager.execute_query(query)
-            if result is not None and not result.empty:
-                # Ensure consistent datetime types (timezone-naive)
-                result['START_TIME'] = pd.to_datetime(result['START_TIME']).dt.tz_localize(None)
-                result['USAGE_MONTH'] = pd.to_datetime(result['USAGE_MONTH']).dt.tz_localize(None)
-            return result
-            
-        except Exception as e:
-            return None
-    
-    def _query_provisioned_throughput_usage(self, view_name: str, service_type: str, columns: list) -> Optional[pd.DataFrame]:
-        """
-        Query CORTEX_PROVISIONED_THROUGHPUT_USAGE_HISTORY which uses INTERVAL_START_TIME/INTERVAL_END_TIME.
-        
-        Based on documentation: PROVISIONED_THROUGHPUT_ID, AI_SERVICE, INTERVAL_START_TIME, INTERVAL_END_TIME, 
-        CLOUD_SERVICE_PROVIDER, MODEL_NAME, TERM_START_DATE, TERM_END_DATE, PTU_COUNT, PTU_CREDITS
-        """
-        try:
-            query = f"""
-            SELECT 
-                INTERVAL_START_TIME as START_TIME,
-                DATE_TRUNC('month', INTERVAL_START_TIME) as USAGE_MONTH,
-                '{service_type}' as AI_SERVICE_TYPE,
-                COALESCE(PTU_CREDITS, 0) as CREDITS_USED,
-                COALESCE(PTU_CREDITS, 0) as TOTAL_CREDITS,
-                COALESCE(PTU_COUNT, 1) as REQUEST_COUNT,
-                COALESCE(PTU_COUNT, 0) as TOKEN_COUNT,
-                COALESCE(MODEL_NAME, AI_SERVICE, 'Unknown') as SERVICE_DETAIL,
-                PROVISIONED_THROUGHPUT_ID,
-                INTERVAL_END_TIME,
-                CLOUD_SERVICE_PROVIDER
-            FROM SNOWFLAKE.ACCOUNT_USAGE.{view_name}
-            WHERE INTERVAL_START_TIME >= DATEADD('month', -12, CURRENT_DATE())
-            ORDER BY INTERVAL_START_TIME DESC
-            LIMIT 1000
-            """
-            
-            result = self.data_manager.execute_query(query)
-            if result is not None and not result.empty:
-                # Ensure consistent datetime types (timezone-naive)
-                result['START_TIME'] = pd.to_datetime(result['START_TIME']).dt.tz_localize(None)
-                result['USAGE_MONTH'] = pd.to_datetime(result['USAGE_MONTH']).dt.tz_localize(None)
-            return result
-            
-        except Exception as e:
-            return None
-    
-    def _query_search_daily_usage(self, view_name: str, service_type: str, columns: list) -> Optional[pd.DataFrame]:
-        """
-        Query CORTEX_SEARCH_DAILY_USAGE_HISTORY which uses USAGE_DATE.
-        
-        Based on documentation: USAGE_DATE, DATABASE_NAME, SCHEMA_NAME, SERVICE_NAME, SERVICE_ID, 
-        CONSUMPTION_TYPE, CREDITS, MODEL_NAME, TOKENS
-        """
-        try:
-            query = f"""
-            SELECT 
-                USAGE_DATE as START_TIME,
-                DATE_TRUNC('month', USAGE_DATE) as USAGE_MONTH,
-                '{service_type}' as AI_SERVICE_TYPE,
-                COALESCE(CREDITS, 0) as CREDITS_USED,
-                COALESCE(CREDITS, 0) as TOTAL_CREDITS,
-                1 as REQUEST_COUNT,
-                COALESCE(TOKENS, 0) as TOKEN_COUNT,
-                COALESCE(SERVICE_NAME, MODEL_NAME, 'Unknown') as SERVICE_DETAIL,
-                DATABASE_NAME,
-                SCHEMA_NAME,
-                SERVICE_ID,
-                CONSUMPTION_TYPE
-            FROM SNOWFLAKE.ACCOUNT_USAGE.{view_name}
-            WHERE USAGE_DATE >= DATEADD('month', -12, CURRENT_DATE())
-            ORDER BY USAGE_DATE DESC
-            LIMIT 1000
-            """
-            
-            result = self.data_manager.execute_query(query)
-            if result is not None and not result.empty:
-                # Ensure consistent datetime types (timezone-naive)
-                result['START_TIME'] = pd.to_datetime(result['START_TIME']).dt.tz_localize(None)
-                result['USAGE_MONTH'] = pd.to_datetime(result['USAGE_MONTH']).dt.tz_localize(None)
-            return result
-            
-        except Exception as e:
-            return None
-    
-    def _query_standard_cortex_view(self, view_name: str, service_type: str, columns: list) -> Optional[pd.DataFrame]:
-        """
-        Query standard Cortex views that should have START_TIME.
-        """
-        try:
-            # Build dynamic column mapping
-            credits_col = self._find_credits_column(columns)
-            request_col = self._find_request_column(columns)
-            token_col = self._find_token_column(columns)
-            detail_col = self._find_detail_column(columns)
-            
-            # Check if START_TIME exists
-            if 'START_TIME' not in columns:
-                time_col = 'CURRENT_DATE()'
-            else:
-                time_col = 'START_TIME'
-            
-            query = f"""
-            SELECT 
-                {time_col} as START_TIME,
-                DATE_TRUNC('month', {time_col}) as USAGE_MONTH,
-                '{service_type}' as AI_SERVICE_TYPE,
-                {credits_col} as CREDITS_USED,
-                {credits_col} as TOTAL_CREDITS,
-                {request_col} as REQUEST_COUNT,
-                {token_col} as TOKEN_COUNT,
-                {detail_col} as SERVICE_DETAIL
-            FROM SNOWFLAKE.ACCOUNT_USAGE.{view_name}
-            WHERE {time_col} >= DATEADD('month', -12, CURRENT_DATE())
-            ORDER BY {time_col} DESC
-            LIMIT 1000
-            """
-            
-            result = self.data_manager.execute_query(query)
-            if result is not None and not result.empty:
-                # Ensure consistent datetime types (timezone-naive)
-                result['START_TIME'] = pd.to_datetime(result['START_TIME']).dt.tz_localize(None)
-                result['USAGE_MONTH'] = pd.to_datetime(result['USAGE_MONTH']).dt.tz_localize(None)
-            return result
-            
-        except Exception as e:
-            return None
-    
-    def _find_credits_column(self, columns: list) -> str:
-        """Find the credits column from available columns based on Snowflake documentation."""
-        # Based on Snowflake documentation, different views use different column names:
-        # CORTEX_ANALYST_USAGE_HISTORY: CREDITS
-        # CORTEX_FUNCTIONS_USAGE_HISTORY: CREDITS_USED  
-        # CORTEX_DOCUMENT_PROCESSING_USAGE_HISTORY: CREDITS_USED
-        # CORTEX_SEARCH_*: Various credit columns
-        
-        credit_candidates = [
-            'CREDITS',           # CORTEX_ANALYST_USAGE_HISTORY
-            'CREDITS_USED',      # CORTEX_FUNCTIONS_USAGE_HISTORY, CORTEX_DOCUMENT_PROCESSING_USAGE_HISTORY
-            'TOTAL_CREDITS',     # Some aggregated views
-            'USAGE_IN_CREDITS',  # Alternative naming
-            'CREDIT_USED'        # Alternative naming
-        ]
-        
-        for candidate in credit_candidates:
-            if candidate in columns:
-                return f"COALESCE({candidate}, 0)"
-        
-        return "0"  # Default if no credits column found
-    
-    def _find_request_column(self, columns: list) -> str:
-        """Find the request/message count column from available columns based on documentation."""
-        # Based on Snowflake documentation:
-        # CORTEX_ANALYST_USAGE_HISTORY: REQUEST_COUNT
-        # CORTEX_FUNCTIONS_USAGE_HISTORY: REQUEST_COUNT
-        # CORTEX_DOCUMENT_PROCESSING_USAGE_HISTORY: REQUEST_COUNT
-        
-        request_candidates = [
-            'REQUEST_COUNT',     # Most common in Cortex views
-            'MESSAGE_COUNT',     # Alternative naming
-            'QUERY_COUNT',       # For query-based views
-            'REQUESTS',          # Simplified naming
-            'OPERATIONS'         # Generic operations count
-        ]
-        
-        for candidate in request_candidates:
-            if candidate in columns:
-                return f"COALESCE({candidate}, 0)"
-        
-        return "1"  # Default to 1 if no count column found
-    
-    def _find_token_column(self, columns: list) -> str:
-        """Find the token/processing count column from available columns based on documentation."""
-        # Based on Snowflake documentation:
-        # CORTEX_ANALYST_USAGE_HISTORY: INPUT_TOKENS, OUTPUT_TOKENS
-        # CORTEX_FUNCTIONS_USAGE_HISTORY: INPUT_TOKENS, OUTPUT_TOKENS  
-        # CORTEX_DOCUMENT_PROCESSING_USAGE_HISTORY: May have different token metrics
-        
-        # Check for combined token columns first (most common in Cortex views)
-        if 'INPUT_TOKENS' in columns and 'OUTPUT_TOKENS' in columns:
-            return "COALESCE(INPUT_TOKENS, 0) + COALESCE(OUTPUT_TOKENS, 0)"
-        
-        if 'PROMPT_TOKENS' in columns and 'COMPLETION_TOKENS' in columns:
-            return "COALESCE(PROMPT_TOKENS, 0) + COALESCE(COMPLETION_TOKENS, 0)"
-        
-        # Check for single token columns
-        token_candidates = [
-            'TOTAL_TOKENS',      # Aggregated token count
-            'TOKEN_COUNT',       # Generic token count
-            'INPUT_TOKENS',      # Input only
-            'OUTPUT_TOKENS',     # Output only
-            'TOKENS',            # Simple naming
-            'PAGE_COUNT',        # For document processing
-            'CHARACTERS'         # Character count alternative
-        ]
-        
-        for candidate in token_candidates:
-            if candidate in columns:
-                return f"COALESCE({candidate}, 0)"
-        
-        return "0"  # Default if no token column found
-    
-    def _find_detail_column(self, columns: list) -> str:
-        """Find the service detail column from available columns based on documentation."""
-        # Based on Snowflake documentation:
-        # CORTEX_ANALYST_USAGE_HISTORY: May have USER_NAME, ROLE_NAME
-        # CORTEX_FUNCTIONS_USAGE_HISTORY: FUNCTION_NAME, MODEL_NAME
-        # CORTEX_DOCUMENT_PROCESSING_USAGE_HISTORY: Various processing details
-        # CORTEX_SEARCH_*: SERVICE_NAME, SEARCH_SERVICE_NAME
-        
-        detail_candidates = [
-            'MODEL_NAME',           # CORTEX_FUNCTIONS_USAGE_HISTORY
-            'FUNCTION_NAME',        # CORTEX_FUNCTIONS_USAGE_HISTORY  
-            'SERVICE_NAME',         # CORTEX_SEARCH_* views
-            'SEARCH_SERVICE_NAME',  # CORTEX_SEARCH_* views
-            'USER_NAME',            # User who made the request
-            'ROLE_NAME',            # Role used for the request
-            'TASK_NAME',            # For task-based operations
-            'ENDPOINT_NAME',        # For endpoint-based services
-            'NAME'                  # Generic name column
-        ]
-        
-        for candidate in detail_candidates:
-            if candidate in columns:
-                return f"COALESCE({candidate}, 'Unknown')"
-        
-        return "'Unknown'"  # Default if no detail column found
-    
-    def _render_no_data_guidance(self) -> None:
-        """Render guidance when no Cortex data is available."""
-        st.warning("📊 No Cortex AI services data found in ACCOUNT_USAGE views.")
-        
-        with st.expander("💡 **How to Enable Cortex Services**"):
-            st.markdown("""
-            **Available Cortex Services:**
-            
-            **🔍 Cortex Search:**
-            - Create search services: `CREATE CORTEX SEARCH SERVICE my_search_service ...`
-            - Query with: `SELECT * FROM TABLE(my_search_service!SEARCH('query'))`
-            
-            **🧠 Cortex Analyst:**
-            - Natural language to SQL: `SELECT SNOWFLAKE.CORTEX.ANALYST('What are my top customers?')`
-            
-            **📄 Document Processing:**
-            - Extract text: `SELECT SNOWFLAKE.CORTEX.PARSE_DOCUMENT(@my_stage/document.pdf)`
-            - Extract answers: `SELECT SNOWFLAKE.CORTEX.EXTRACT_ANSWER(text, 'What is the total?')`
-            
-            **🤖 Cortex Functions:**
-            - Complete text: `SELECT SNOWFLAKE.CORTEX.COMPLETE('llama2-70b-chat', 'Write a summary')`
-            - Translate: `SELECT SNOWFLAKE.CORTEX.TRANSLATE('Hello', 'en', 'es')`
-            - Sentiment: `SELECT SNOWFLAKE.CORTEX.SENTIMENT('I love this product!')`
-            
-            **⚡ Fine-tuning & Provisioned Throughput:**
-            - Custom model training and dedicated capacity options
-            """)
-        
-        st.info("""
-        **To see Cortex usage data:**
-        1. **Start using Cortex services** with the examples above
-        2. **Wait for data**: ACCOUNT_USAGE views have up to 3 hours latency  
-        3. **Check permissions**: Ensure ACCOUNTADMIN role for full access
-        4. **Verify account**: Some Cortex features require specific account types/regions
-        """)
-    
-    def _render_overall_summary(self, data: pd.DataFrame) -> None:
-        """
-        Render overall AI services summary with totals across all Cortex services.
+        Displays:
+        - Section header with date range
+        - Three key metrics: Total Credits, Daily Average, Last 30 Days
+        - Line chart showing credit consumption over time
+        - Sortable data table with daily details
         
         Args:
-            data (pd.DataFrame): Combined Cortex services data
+            data: DataFrame with columns SERVICE_TYPE, USAGE_DATE, CREDITS_USED
         """
-        st.markdown("#### 📊 Overall AI Services Summary")
+        # Section header
+        st.markdown("---")
+        st.markdown("#### 📊 Account-Level AI Services")
         
-        # Calculate totals across all services
-        total_credits = data['TOTAL_CREDITS'].sum()
-        total_requests = data['REQUEST_COUNT'].sum()
-        total_tokens = data['TOKEN_COUNT'].sum()
-        unique_services = data['AI_SERVICE_TYPE'].nunique()
+        # Display date range
+        if not data.empty and 'USAGE_DATE' in data.columns:
+            min_date = data['USAGE_DATE'].min()
+            max_date = data['USAGE_DATE'].max()
+            st.caption(f"Data from {min_date.strftime('%Y-%m-%d')} to {max_date.strftime('%Y-%m-%d')}")
         
-        # Display overall metrics
-        col1, col2, col3, col4 = st.columns(4)
+        # Calculate metrics
+        total_credits = data['CREDITS_USED'].sum()
+        num_days = len(data)
+        daily_avg = total_credits / num_days if num_days > 0 else 0
         
+        # Last 30 days
+        last_30_days = data.head(30) if len(data) >= 30 else data
+        last_30_credits = last_30_days['CREDITS_USED'].sum()
+        
+        # Display metrics
+        col1, col2, col3 = st.columns(3)
         with col1:
-            st.metric(
-                label="Total AI Credits",
-                value=f"{total_credits:,.0f}",
-                help="Total credits consumed across all Cortex services"
-            )
-        
+            st.metric("Total Credits", self._format_credits(total_credits))
         with col2:
-            st.metric(
-                label="Total Requests",
-                value=f"{total_requests:,.0f}",
-                help="Total requests across all Cortex services"
-            )
-        
+            st.metric("Daily Average", self._format_credits(daily_avg))
         with col3:
-            st.metric(
-                label="Total Tokens/Operations",
-                value=f"{total_tokens:,.0f}",
-                help="Total tokens processed or operations performed"
-            )
+            st.metric("Last 30 Days", self._format_credits(last_30_credits))
         
-        with col4:
-            st.metric(
-                label="Active Service Types",
-                value=f"{unique_services}",
-                help="Number of different Cortex service types in use"
-            )
+        # Line chart - Credits over time
+        st.markdown("##### Credit Consumption Trend")
         
-        # Overall trends chart
-        st.markdown("#### 📈 Overall AI Services Trends")
+        # Sort by date for proper line chart
+        chart_data = data.sort_values('USAGE_DATE')
         
-        monthly_totals = data.groupby('USAGE_MONTH').agg({
-            'TOTAL_CREDITS': 'sum',
-            'REQUEST_COUNT': 'sum',
-            'TOKEN_COUNT': 'sum'
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(
+            x=chart_data['USAGE_DATE'],
+            y=chart_data['CREDITS_USED'],
+            mode='lines+markers',
+            name='Credits Used',
+            line=dict(color='#1f77b4', width=2),
+            marker=dict(size=6)
+        ))
+        
+        fig.update_layout(
+            xaxis_title="Date",
+            yaxis_title="Credits Used",
+            hovermode='x unified',
+            height=400,
+            showlegend=False,
+            margin=dict(l=0, r=0, t=30, b=0)
+        )
+        
+        st.plotly_chart(fig, use_container_width=True)
+        
+        # Data table
+        st.markdown("##### Daily Usage Details")
+        
+        # Prepare table data
+        table_data = data.copy()
+        table_data['USAGE_DATE'] = table_data['USAGE_DATE'].dt.strftime('%Y-%m-%d')
+        table_data['CREDITS_USED'] = table_data['CREDITS_USED'].apply(self._format_credits)
+        table_data = table_data.rename(columns={
+            'USAGE_DATE': 'Usage Date',
+            'CREDITS_USED': 'Credits Used'
+        })
+        
+        # Display only relevant columns
+        display_cols = ['Usage Date', 'Credits Used']
+        st.dataframe(
+            table_data[display_cols],
+            use_container_width=True,
+            hide_index=True,
+            height=400
+        )
+    
+    def _get_cortex_functions_data(self) -> Optional[pd.DataFrame]:
+        """
+        Retrieve Cortex Functions usage data from CORTEX_FUNCTIONS_USAGE_HISTORY.
+        
+        Queries SNOWFLAKE.ACCOUNT_USAGE.CORTEX_FUNCTIONS_USAGE_HISTORY to get
+        function-level AI usage with details on function names, models, and token credits.
+        
+        Test Query:
+        SELECT 
+            FUNCTION_NAME,
+            MODEL_NAME,
+            START_TIME,
+            END_TIME,
+            TOKEN_CREDITS
+        FROM SNOWFLAKE.ACCOUNT_USAGE.CORTEX_FUNCTIONS_USAGE_HISTORY
+        WHERE START_TIME >= DATEADD('month', -12, CURRENT_DATE())
+        ORDER BY START_TIME DESC;
+        
+        Returns:
+            Optional[pd.DataFrame]: DataFrame with columns FUNCTION_NAME, MODEL_NAME, 
+                                   START_TIME, END_TIME, TOKEN_CREDITS,
+                                   or None if query fails or no data exists
+        """
+        query = """
+        SELECT 
+            FUNCTION_NAME,
+            MODEL_NAME,
+            START_TIME,
+            END_TIME,
+            TOKEN_CREDITS
+        FROM SNOWFLAKE.ACCOUNT_USAGE.CORTEX_FUNCTIONS_USAGE_HISTORY
+        WHERE START_TIME >= DATEADD('month', -12, CURRENT_DATE())
+        ORDER BY START_TIME DESC
+        """
+        
+        try:
+            data = self.data_manager.execute_query(query)
+            
+            if data is None or data.empty:
+                return None
+            
+            # Handle NULL token_credits (convert to 0)
+            if 'TOKEN_CREDITS' in data.columns:
+                data['TOKEN_CREDITS'] = data['TOKEN_CREDITS'].fillna(0)
+            
+            # Handle timezone normalization for timestamp columns
+            if 'START_TIME' in data.columns:
+                data['START_TIME'] = pd.to_datetime(data['START_TIME']).dt.tz_localize(None)
+            
+            if 'END_TIME' in data.columns:
+                data['END_TIME'] = pd.to_datetime(data['END_TIME']).dt.tz_localize(None)
+            
+            return data
+            
+        except Exception as e:
+            # View may not exist in some accounts
+            st.warning(f"Cortex Functions data not available: {str(e)}")
+            return None
+    
+    def _render_cortex_functions_section(self, data: pd.DataFrame) -> None:
+        """
+        Render Cortex Functions section with metrics, charts, and data table.
+        
+        Displays:
+        - Section header with date range
+        - Two key metrics: Total Credits, Unique Function Count
+        - Horizontal bar chart: Credits by Function Name
+        - Horizontal bar chart: Credits by Model Name
+        - Sortable data table with aggregated details
+        
+        Args:
+            data: DataFrame with columns FUNCTION_NAME, MODEL_NAME, TOKEN_CREDITS, START_TIME, END_TIME
+        """
+        # Section header
+        st.markdown("---")
+        st.markdown("#### 🔧 Cortex Functions")
+        
+        # Display date range
+        if not data.empty and 'START_TIME' in data.columns:
+            min_date = data['START_TIME'].min()
+            max_date = data['START_TIME'].max()
+            st.caption(f"Data from {min_date.strftime('%Y-%m-%d')} to {max_date.strftime('%Y-%m-%d')}")
+        
+        # Calculate metrics
+        total_credits = data['TOKEN_CREDITS'].sum()
+        unique_functions = data['FUNCTION_NAME'].nunique()
+        
+        # Display metrics
+        col1, col2 = st.columns(2)
+        with col1:
+            st.metric("Total Credits", self._format_credits(total_credits))
+        with col2:
+            st.metric("Unique Functions", f"{unique_functions}")
+        
+        # Aggregate by function name
+        function_agg = data.groupby('FUNCTION_NAME').agg({
+            'TOKEN_CREDITS': 'sum'
+        }).reset_index().sort_values('TOKEN_CREDITS', ascending=True)
+        
+        # Bar chart - Credits by Function Name
+        st.markdown("##### Credits by Function Name")
+        fig_func = go.Figure()
+        fig_func.add_trace(go.Bar(
+            y=function_agg['FUNCTION_NAME'],
+            x=function_agg['TOKEN_CREDITS'],
+            orientation='h',
+            marker=dict(color='#1f77b4')
+        ))
+        
+        fig_func.update_layout(
+            xaxis_title="Credits",
+            yaxis_title="Function Name",
+            height=max(300, len(function_agg) * 30),
+            showlegend=False,
+            margin=dict(l=0, r=0, t=10, b=0)
+        )
+        
+        st.plotly_chart(fig_func, use_container_width=True)
+        
+        # Aggregate by model name
+        model_agg = data.groupby('MODEL_NAME').agg({
+            'TOKEN_CREDITS': 'sum'
+        }).reset_index().sort_values('TOKEN_CREDITS', ascending=True)
+        
+        # Bar chart - Credits by Model Name
+        st.markdown("##### Credits by Model Name")
+        fig_model = go.Figure()
+        fig_model.add_trace(go.Bar(
+            y=model_agg['MODEL_NAME'],
+            x=model_agg['TOKEN_CREDITS'],
+            orientation='h',
+            marker=dict(color='#2ca02c')
+        ))
+        
+        fig_model.update_layout(
+            xaxis_title="Credits",
+            yaxis_title="Model Name",
+            height=max(300, len(model_agg) * 30),
+            showlegend=False,
+            margin=dict(l=0, r=0, t=10, b=0)
+        )
+        
+        st.plotly_chart(fig_model, use_container_width=True)
+        
+        # Data table - Aggregated by Function and Model
+        st.markdown("##### Function Usage Details")
+        
+        # Aggregate for table
+        table_agg = data.groupby(['FUNCTION_NAME', 'MODEL_NAME']).agg({
+            'TOKEN_CREDITS': 'sum',
+            'START_TIME': ['min', 'max']
         }).reset_index()
         
-        if not monthly_totals.empty:
-            fig = px.line(
-                monthly_totals,
-                x='USAGE_MONTH',
-                y='TOTAL_CREDITS',
-                title='Monthly Total AI Services Credits',
-                labels={
-                    'USAGE_MONTH': 'Month',
-                    'TOTAL_CREDITS': 'Total Credits Used'
-                }
-            )
-            
-            # Add time range information
-            update_chart_with_time_range(
-                fig, 
-                monthly_totals, 
-                'USAGE_MONTH', 
-                'Month', 
-                'Monthly Total AI Services Credits'
-            )
-            
-            fig.update_layout(height=400)
-            render_plotly_chart(fig)
+        # Flatten column names
+        table_agg.columns = ['Function Name', 'Model Name', 'Total Credits', 'First Usage', 'Last Usage']
+        
+        # Format columns
+        table_agg['Total Credits'] = table_agg['Total Credits'].apply(self._format_credits)
+        table_agg['First Usage'] = pd.to_datetime(table_agg['First Usage']).dt.strftime('%Y-%m-%d')
+        table_agg['Last Usage'] = pd.to_datetime(table_agg['Last Usage']).dt.strftime('%Y-%m-%d')
+        table_agg['Date Range'] = table_agg['First Usage'] + ' to ' + table_agg['Last Usage']
+        
+        # Add usage count
+        usage_counts = data.groupby(['FUNCTION_NAME', 'MODEL_NAME']).size().reset_index(name='Usage Count')
+        table_agg = table_agg.merge(
+            usage_counts,
+            left_on=['Function Name', 'Model Name'],
+            right_on=['FUNCTION_NAME', 'MODEL_NAME'],
+            how='left'
+        )
+        
+        # Display table
+        display_cols = ['Function Name', 'Model Name', 'Total Credits', 'Usage Count', 'Date Range']
+        st.dataframe(
+            table_agg[display_cols],
+            use_container_width=True,
+            hide_index=True,
+            height=400
+        )
     
-    def _render_service_breakdowns(self, data: pd.DataFrame) -> None:
+    def _get_cortex_analyst_data(self) -> Optional[pd.DataFrame]:
         """
-        Render detailed breakdowns for each Cortex service type.
+        Retrieve Cortex Analyst usage data from CORTEX_ANALYST_USAGE_HISTORY.
+        
+        Queries SNOWFLAKE.ACCOUNT_USAGE.CORTEX_ANALYST_USAGE_HISTORY to get
+        analyst-level AI usage with details on usernames, credits, and request counts.
+        
+        Test Query:
+        SELECT 
+            USERNAME,
+            CREDITS,
+            REQUEST_COUNT,
+            START_TIME,
+            END_TIME
+        FROM SNOWFLAKE.ACCOUNT_USAGE.CORTEX_ANALYST_USAGE_HISTORY
+        WHERE START_TIME >= DATEADD('month', -12, CURRENT_DATE())
+        ORDER BY START_TIME DESC;
+        
+        Returns:
+            Optional[pd.DataFrame]: DataFrame with columns USERNAME, CREDITS, REQUEST_COUNT,
+                                   START_TIME, END_TIME,
+                                   or None if query fails or no data exists
+        """
+        query = """
+        SELECT 
+            USERNAME,
+            CREDITS,
+            REQUEST_COUNT,
+            START_TIME,
+            END_TIME
+        FROM SNOWFLAKE.ACCOUNT_USAGE.CORTEX_ANALYST_USAGE_HISTORY
+        WHERE START_TIME >= DATEADD('month', -12, CURRENT_DATE())
+        ORDER BY START_TIME DESC
+        """
+        
+        try:
+            data = self.data_manager.execute_query(query)
+            
+            if data is None or data.empty:
+                return None
+            
+            # Handle NULL credits and request_count (convert to 0)
+            if 'CREDITS' in data.columns:
+                data['CREDITS'] = data['CREDITS'].fillna(0)
+            
+            if 'REQUEST_COUNT' in data.columns:
+                data['REQUEST_COUNT'] = data['REQUEST_COUNT'].fillna(0)
+            
+            # Handle timezone normalization for timestamp columns
+            if 'START_TIME' in data.columns:
+                data['START_TIME'] = pd.to_datetime(data['START_TIME']).dt.tz_localize(None)
+            
+            if 'END_TIME' in data.columns:
+                data['END_TIME'] = pd.to_datetime(data['END_TIME']).dt.tz_localize(None)
+            
+            return data
+            
+        except Exception as e:
+            # View may not exist in some accounts
+            st.warning(f"Cortex Analyst data not available: {str(e)}")
+            return None
+    
+    def _render_cortex_analyst_section(self, data: pd.DataFrame) -> None:
+        """
+        Render Cortex Analyst section with metrics, chart, and data table.
+        
+        Displays:
+        - Section header with date range
+        - Two key metrics: Total Credits, Total Requests
+        - Horizontal bar chart: Credits by Username
+        - Sortable data table with aggregated details
         
         Args:
-            data (pd.DataFrame): Combined Cortex services data
+            data: DataFrame with columns USERNAME, CREDITS, REQUEST_COUNT, START_TIME, END_TIME
         """
-        st.markdown("#### 🔍 Service-Specific Breakdowns")
+        # Section header
+        st.markdown("---")
+        st.markdown("#### 🤖 Cortex Analyst")
         
-        # Service breakdown tabs
-        service_types = sorted(data['AI_SERVICE_TYPE'].unique())
+        # Display date range
+        if not data.empty and 'START_TIME' in data.columns:
+            min_date = data['START_TIME'].min()
+            max_date = data['START_TIME'].max()
+            st.caption(f"Data from {min_date.strftime('%Y-%m-%d')} to {max_date.strftime('%Y-%m-%d')}")
         
-        if len(service_types) > 1:
-            # Create tabs for each service type
-            service_tabs = st.tabs([f"📊 {service}" for service in service_types])
-            
-            for i, service_type in enumerate(service_types):
-                with service_tabs[i]:
-                    service_data = data[data['AI_SERVICE_TYPE'] == service_type]
-                    self._render_individual_service_analysis(service_type, service_data)
-        else:
-            # Single service - render directly
-            service_type = service_types[0]
-            service_data = data[data['AI_SERVICE_TYPE'] == service_type]
-            self._render_individual_service_analysis(service_type, service_data)
-    
-    def _render_individual_service_analysis(self, service_type: str, data: pd.DataFrame) -> None:
-        """
-        Render analysis for an individual Cortex service.
+        # Calculate metrics
+        total_credits = data['CREDITS'].sum()
+        total_requests = data['REQUEST_COUNT'].sum()
         
-        Args:
-            service_type (str): Name of the service type
-            data (pd.DataFrame): Data for this specific service
-        """
-        st.markdown(f"**{service_type} Analysis**")
-        
-        # Service-specific metrics
-        col1, col2, col3 = st.columns(3)
-        
+        # Display metrics
+        col1, col2 = st.columns(2)
         with col1:
-            st.metric(
-                label="Credits Used",
-                value=f"{data['TOTAL_CREDITS'].sum():,.0f}"
-            )
-        
+            st.metric("Total Credits", self._format_credits(total_credits))
         with col2:
-            st.metric(
-                label="Total Requests",
-                value=f"{data['REQUEST_COUNT'].sum():,.0f}"
-            )
+            st.metric("Total Requests", f"{int(total_requests):,}")
         
-        with col3:
-            st.metric(
-                label="Avg Credits/Request",
-                value=f"{data['TOTAL_CREDITS'].sum() / max(data['REQUEST_COUNT'].sum(), 1):,.2f}"
-            )
+        # Aggregate by username
+        user_agg = data.groupby('USERNAME').agg({
+            'CREDITS': 'sum',
+            'REQUEST_COUNT': 'sum'
+        }).reset_index().sort_values('CREDITS', ascending=True)
         
-        # Monthly trend for this service
-        monthly_service = data.groupby('USAGE_MONTH')['TOTAL_CREDITS'].sum().reset_index()
+        # Bar chart - Credits by Username
+        st.markdown("##### Credits by Username")
+        fig = go.Figure()
+        fig.add_trace(go.Bar(
+            y=user_agg['USERNAME'],
+            x=user_agg['CREDITS'],
+            orientation='h',
+            marker=dict(color='#ff7f0e')
+        ))
         
-        if len(monthly_service) > 1:
-            fig = px.bar(
-                monthly_service,
-                x='USAGE_MONTH',
-                y='TOTAL_CREDITS',
-                title=f'{service_type} Monthly Usage',
-                labels={
-                    'USAGE_MONTH': 'Month',
-                    'TOTAL_CREDITS': 'Credits Used'
-                }
-            )
-            
-            update_chart_with_time_range(
-                fig, 
-                monthly_service, 
-                'USAGE_MONTH', 
-                'Month', 
-                f'{service_type} Monthly Usage'
-            )
-            
-            fig.update_layout(height=300)
-            render_plotly_chart(fig)
+        fig.update_layout(
+            xaxis_title="Credits",
+            yaxis_title="Username",
+            height=max(300, len(user_agg) * 30),
+            showlegend=False,
+            margin=dict(l=0, r=0, t=10, b=0)
+        )
         
-        # Service details breakdown
-        if 'SERVICE_DETAIL' in data.columns and data['SERVICE_DETAIL'].nunique() > 1:
-            st.markdown(f"**{service_type} Details:**")
-            
-            details_summary = data.groupby('SERVICE_DETAIL').agg({
-                'TOTAL_CREDITS': 'sum',
-                'REQUEST_COUNT': 'sum',
-                'TOKEN_COUNT': 'sum'
-            }).reset_index().sort_values('TOTAL_CREDITS', ascending=False)
-            
-            st.dataframe(
-                details_summary.head(10),
-                use_container_width=True,
-                hide_index=True
-            )
+        st.plotly_chart(fig, use_container_width=True)
+        
+        # Data table - Aggregated by Username
+        st.markdown("##### Analyst Usage Details")
+        
+        # Aggregate for table
+        table_agg = data.groupby('USERNAME').agg({
+            'CREDITS': 'sum',
+            'REQUEST_COUNT': 'sum',
+            'START_TIME': ['min', 'max']
+        }).reset_index()
+        
+        # Flatten column names
+        table_agg.columns = ['Username', 'Total Credits', 'Request Count', 'First Usage', 'Last Usage']
+        
+        # Format columns
+        table_agg['Total Credits'] = table_agg['Total Credits'].apply(self._format_credits)
+        table_agg['Request Count'] = table_agg['Request Count'].astype(int)
+        table_agg['First Usage'] = pd.to_datetime(table_agg['First Usage']).dt.strftime('%Y-%m-%d')
+        table_agg['Last Usage'] = pd.to_datetime(table_agg['Last Usage']).dt.strftime('%Y-%m-%d')
+        table_agg['Date Range'] = table_agg['First Usage'] + ' to ' + table_agg['Last Usage']
+        
+        # Display table
+        display_cols = ['Username', 'Total Credits', 'Request Count', 'Date Range']
+        st.dataframe(
+            table_agg[display_cols],
+            use_container_width=True,
+            hide_index=True,
+            height=400
+        )
     
-    def _render_optimization_insights(self, data: pd.DataFrame) -> None:
+    def _get_cortex_search_data(self) -> Optional[pd.DataFrame]:
         """
-        Render optimization insights and recommendations.
+        Retrieve Cortex Search usage data from CORTEX_SEARCH_DAILY_USAGE_HISTORY.
+        
+        Queries SNOWFLAKE.ACCOUNT_USAGE.CORTEX_SEARCH_DAILY_USAGE_HISTORY to get
+        search service usage with details on databases, schemas, services, and consumption types.
+        
+        Test Query:
+        SELECT 
+            USAGE_DATE,
+            DATABASE_NAME,
+            SCHEMA_NAME,
+            SERVICE_NAME,
+            CONSUMPTION_TYPE,
+            CREDITS
+        FROM SNOWFLAKE.ACCOUNT_USAGE.CORTEX_SEARCH_DAILY_USAGE_HISTORY
+        WHERE USAGE_DATE >= DATEADD('month', -12, CURRENT_DATE())
+        ORDER BY USAGE_DATE DESC;
+        
+        Returns:
+            Optional[pd.DataFrame]: DataFrame with columns USAGE_DATE, DATABASE_NAME, SCHEMA_NAME,
+                                   SERVICE_NAME, CONSUMPTION_TYPE, CREDITS,
+                                   or None if query fails or no data exists
+        """
+        query = """
+        SELECT 
+            USAGE_DATE,
+            DATABASE_NAME,
+            SCHEMA_NAME,
+            SERVICE_NAME,
+            CONSUMPTION_TYPE,
+            CREDITS
+        FROM SNOWFLAKE.ACCOUNT_USAGE.CORTEX_SEARCH_DAILY_USAGE_HISTORY
+        WHERE USAGE_DATE >= DATEADD('month', -12, CURRENT_DATE())
+        ORDER BY USAGE_DATE DESC
+        """
+        
+        try:
+            data = self.data_manager.execute_query(query)
+            
+            if data is None or data.empty:
+                return None
+            
+            # Handle NULL credits (convert to 0)
+            if 'CREDITS' in data.columns:
+                data['CREDITS'] = data['CREDITS'].fillna(0)
+            
+            # Handle timezone normalization for date column
+            if 'USAGE_DATE' in data.columns:
+                data['USAGE_DATE'] = pd.to_datetime(data['USAGE_DATE']).dt.tz_localize(None)
+            
+            return data
+            
+        except Exception as e:
+            # View may not exist in some accounts
+            st.warning(f"Cortex Search data not available: {str(e)}")
+            return None
+    
+    def _render_cortex_search_section(self, data: pd.DataFrame) -> None:
+        """
+        Render Cortex Search section with metrics, charts, and data table.
+        
+        Displays:
+        - Section header with date range
+        - Two key metrics: Total Credits, Unique Service Count
+        - Horizontal bar chart: Credits by Service Name
+        - Horizontal bar chart: Credits by Consumption Type
+        - Sortable data table with aggregated details
         
         Args:
-            data (pd.DataFrame): Combined Cortex services data
+            data: DataFrame with columns USAGE_DATE, DATABASE_NAME, SCHEMA_NAME, 
+                  SERVICE_NAME, CONSUMPTION_TYPE, CREDITS
         """
-        with st.expander("💡 **AI Services Optimization Insights**"):
-            col1, col2 = st.columns(2)
+        # Section header
+        st.markdown("---")
+        st.markdown("#### 🔍 Cortex Search")
+        
+        # Display date range
+        if not data.empty and 'USAGE_DATE' in data.columns:
+            min_date = data['USAGE_DATE'].min()
+            max_date = data['USAGE_DATE'].max()
+            st.caption(f"Data from {min_date.strftime('%Y-%m-%d')} to {max_date.strftime('%Y-%m-%d')}")
+        
+        # Calculate metrics
+        total_credits = data['CREDITS'].sum()
+        unique_services = data['SERVICE_NAME'].nunique()
+        
+        # Display metrics
+        col1, col2 = st.columns(2)
+        with col1:
+            st.metric("Total Credits", self._format_credits(total_credits))
+        with col2:
+            st.metric("Unique Services", f"{unique_services}")
+        
+        # Aggregate by service name
+        service_agg = data.groupby('SERVICE_NAME').agg({
+            'CREDITS': 'sum'
+        }).reset_index().sort_values('CREDITS', ascending=True)
+        
+        # Bar chart - Credits by Service Name
+        st.markdown("##### Credits by Service Name")
+        fig_service = go.Figure()
+        fig_service.add_trace(go.Bar(
+            y=service_agg['SERVICE_NAME'],
+            x=service_agg['CREDITS'],
+            orientation='h',
+            marker=dict(color='#d62728')
+        ))
+        
+        fig_service.update_layout(
+            xaxis_title="Credits",
+            yaxis_title="Service Name",
+            height=max(300, len(service_agg) * 30),
+            showlegend=False,
+            margin=dict(l=0, r=0, t=10, b=0)
+        )
+        
+        st.plotly_chart(fig_service, use_container_width=True)
+        
+        # Aggregate by consumption type
+        type_agg = data.groupby('CONSUMPTION_TYPE').agg({
+            'CREDITS': 'sum'
+        }).reset_index().sort_values('CREDITS', ascending=True)
+        
+        # Bar chart - Credits by Consumption Type
+        st.markdown("##### Credits by Consumption Type")
+        fig_type = go.Figure()
+        fig_type.add_trace(go.Bar(
+            y=type_agg['CONSUMPTION_TYPE'],
+            x=type_agg['CREDITS'],
+            orientation='h',
+            marker=dict(color='#9467bd')
+        ))
+        
+        fig_type.update_layout(
+            xaxis_title="Credits",
+            yaxis_title="Consumption Type",
+            height=max(300, len(type_agg) * 30),
+            showlegend=False,
+            margin=dict(l=0, r=0, t=10, b=0)
+        )
+        
+        st.plotly_chart(fig_type, use_container_width=True)
+        
+        # Data table - Aggregated by Database, Schema, Service, and Type
+        st.markdown("##### Search Usage Details")
+        
+        # Aggregate for table
+        table_agg = data.groupby(['DATABASE_NAME', 'SCHEMA_NAME', 'SERVICE_NAME', 'CONSUMPTION_TYPE']).agg({
+            'CREDITS': 'sum',
+            'USAGE_DATE': ['min', 'max']
+        }).reset_index()
+        
+        # Flatten column names
+        table_agg.columns = ['Database', 'Schema', 'Service Name', 'Consumption Type', 
+                            'Total Credits', 'First Usage', 'Last Usage']
+        
+        # Format columns
+        table_agg['Total Credits'] = table_agg['Total Credits'].apply(self._format_credits)
+        table_agg['First Usage'] = pd.to_datetime(table_agg['First Usage']).dt.strftime('%Y-%m-%d')
+        table_agg['Last Usage'] = pd.to_datetime(table_agg['Last Usage']).dt.strftime('%Y-%m-%d')
+        table_agg['Date Range'] = table_agg['First Usage'] + ' to ' + table_agg['Last Usage']
+        
+        # Display table
+        display_cols = ['Database', 'Schema', 'Service Name', 'Consumption Type', 'Total Credits', 'Date Range']
+        st.dataframe(
+            table_agg[display_cols],
+            use_container_width=True,
+            hide_index=True,
+            height=400
+        )
+    
+    def _get_document_ai_data(self) -> Optional[pd.DataFrame]:
+        """
+        Retrieve Document AI usage data from DOCUMENT_AI_USAGE_HISTORY.
+        
+        Queries SNOWFLAKE.ACCOUNT_USAGE.DOCUMENT_AI_USAGE_HISTORY to get
+        document processing usage with details on operations, page counts, and document counts.
+        
+        Test Query:
+        SELECT 
+            OPERATION_NAME,
+            PAGE_COUNT,
+            DOCUMENT_COUNT,
+            CREDITS_USED,
+            START_TIME,
+            END_TIME
+        FROM SNOWFLAKE.ACCOUNT_USAGE.DOCUMENT_AI_USAGE_HISTORY
+        WHERE START_TIME >= DATEADD('month', -12, CURRENT_DATE())
+        ORDER BY START_TIME DESC;
+        
+        Returns:
+            Optional[pd.DataFrame]: DataFrame with columns OPERATION_NAME, PAGE_COUNT, DOCUMENT_COUNT,
+                                   CREDITS_USED, START_TIME, END_TIME,
+                                   or None if query fails or no data exists
+        """
+        query = """
+        SELECT 
+            OPERATION_NAME,
+            PAGE_COUNT,
+            DOCUMENT_COUNT,
+            CREDITS_USED,
+            START_TIME,
+            END_TIME
+        FROM SNOWFLAKE.ACCOUNT_USAGE.DOCUMENT_AI_USAGE_HISTORY
+        WHERE START_TIME >= DATEADD('month', -12, CURRENT_DATE())
+        ORDER BY START_TIME DESC
+        """
+        
+        try:
+            data = self.data_manager.execute_query(query)
             
-            with col1:
-                st.markdown("**📊 Usage Patterns:**")
-                
-                # Most active service
-                service_usage = data.groupby('AI_SERVICE_TYPE')['REQUEST_COUNT'].sum().sort_values(ascending=False)
-                if not service_usage.empty:
-                    st.write(f"• **Most Active**: {service_usage.index[0]} ({service_usage.iloc[0]:,} requests)")
-                
-                # Most expensive service
-                service_costs = data.groupby('AI_SERVICE_TYPE')['TOTAL_CREDITS'].sum().sort_values(ascending=False)
-                if not service_costs.empty:
-                    st.write(f"• **Highest Cost**: {service_costs.index[0]} ({service_costs.iloc[0]:,.0f} credits)")
-                
-                # Usage distribution
-                if len(service_usage) > 1:
-                    top_service_pct = (service_usage.iloc[0] / service_usage.sum()) * 100
-                    st.write(f"• **Usage Concentration**: {top_service_pct:.1f}% from top service")
+            if data is None or data.empty:
+                return None
             
-            with col2:
-                st.markdown("**💰 Cost Efficiency:**")
-                
-                # Cost per request by service
-                cost_efficiency = data.groupby('AI_SERVICE_TYPE').apply(
-                    lambda x: x['TOTAL_CREDITS'].sum() / max(x['REQUEST_COUNT'].sum(), 1)
-                ).sort_values()
-                
-                if not cost_efficiency.empty:
-                    st.write(f"• **Most Efficient**: {cost_efficiency.index[0]} ({cost_efficiency.iloc[0]:.3f} credits/req)")
-                    if len(cost_efficiency) > 1:
-                        st.write(f"• **Least Efficient**: {cost_efficiency.index[-1]} ({cost_efficiency.iloc[-1]:.3f} credits/req)")
-                
-                # Growth trend
-                if len(data) > 1:
-                    recent_period = data['START_TIME'] >= data['START_TIME'].quantile(0.7)
-                    recent_credits = data[recent_period]['TOTAL_CREDITS'].sum()
-                    earlier_credits = data[~recent_period]['TOTAL_CREDITS'].sum()
-                    
-                    if earlier_credits > 0:
-                        growth = ((recent_credits - earlier_credits) / earlier_credits) * 100
-                        trend_emoji = "📈" if growth > 0 else "📉"
-                        st.write(f"• **Usage Trend**: {trend_emoji} {growth:+.1f}%")
+            # Handle NULL values (convert to 0)
+            if 'CREDITS_USED' in data.columns:
+                data['CREDITS_USED'] = data['CREDITS_USED'].fillna(0)
+            
+            if 'PAGE_COUNT' in data.columns:
+                data['PAGE_COUNT'] = data['PAGE_COUNT'].fillna(0)
+            
+            if 'DOCUMENT_COUNT' in data.columns:
+                data['DOCUMENT_COUNT'] = data['DOCUMENT_COUNT'].fillna(0)
+            
+            # Handle timezone normalization for timestamp columns
+            if 'START_TIME' in data.columns:
+                data['START_TIME'] = pd.to_datetime(data['START_TIME']).dt.tz_localize(None)
+            
+            if 'END_TIME' in data.columns:
+                data['END_TIME'] = pd.to_datetime(data['END_TIME']).dt.tz_localize(None)
+            
+            return data
+            
+        except Exception as e:
+            # View may not exist in some accounts
+            st.warning(f"Document AI data not available: {str(e)}")
+            return None
+    
+    def _render_document_ai_section(self, data: pd.DataFrame) -> None:
+        """
+        Render Document AI section with metrics, chart, and data table.
+        
+        Displays:
+        - Section header with date range
+        - Three key metrics: Total Credits, Total Pages, Total Documents
+        - Horizontal bar chart: Credits by Operation Name
+        - Sortable data table with aggregated details
+        
+        Args:
+            data: DataFrame with columns OPERATION_NAME, PAGE_COUNT, DOCUMENT_COUNT,
+                  CREDITS_USED, START_TIME, END_TIME
+        """
+        # Section header
+        st.markdown("---")
+        st.markdown("#### 📄 Document AI")
+        
+        # Display date range
+        if not data.empty and 'START_TIME' in data.columns:
+            min_date = data['START_TIME'].min()
+            max_date = data['START_TIME'].max()
+            st.caption(f"Data from {min_date.strftime('%Y-%m-%d')} to {max_date.strftime('%Y-%m-%d')}")
+        
+        # Calculate metrics
+        total_credits = data['CREDITS_USED'].sum()
+        total_pages = data['PAGE_COUNT'].sum()
+        total_docs = data['DOCUMENT_COUNT'].sum()
+        
+        # Display metrics
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric("Total Credits", self._format_credits(total_credits))
+        with col2:
+            st.metric("Total Pages", f"{int(total_pages):,}")
+        with col3:
+            st.metric("Total Documents", f"{int(total_docs):,}")
+        
+        # Aggregate by operation name
+        op_agg = data.groupby('OPERATION_NAME').agg({
+            'CREDITS_USED': 'sum',
+            'PAGE_COUNT': 'sum',
+            'DOCUMENT_COUNT': 'sum'
+        }).reset_index().sort_values('CREDITS_USED', ascending=True)
+        
+        # Bar chart - Credits by Operation Name
+        st.markdown("##### Credits by Operation Name")
+        fig = go.Figure()
+        fig.add_trace(go.Bar(
+            y=op_agg['OPERATION_NAME'],
+            x=op_agg['CREDITS_USED'],
+            orientation='h',
+            marker=dict(color='#8c564b')
+        ))
+        
+        fig.update_layout(
+            xaxis_title="Credits",
+            yaxis_title="Operation Name",
+            height=max(300, len(op_agg) * 30),
+            showlegend=False,
+            margin=dict(l=0, r=0, t=10, b=0)
+        )
+        
+        st.plotly_chart(fig, use_container_width=True)
+        
+        # Data table - Aggregated by Operation
+        st.markdown("##### Document AI Usage Details")
+        
+        # Aggregate for table
+        table_agg = data.groupby('OPERATION_NAME').agg({
+            'CREDITS_USED': 'sum',
+            'PAGE_COUNT': 'sum',
+            'DOCUMENT_COUNT': 'sum',
+            'START_TIME': ['min', 'max']
+        }).reset_index()
+        
+        # Flatten column names
+        table_agg.columns = ['Operation Name', 'Total Credits', 'Total Pages', 
+                            'Total Documents', 'First Usage', 'Last Usage']
+        
+        # Format columns
+        table_agg['Total Credits'] = table_agg['Total Credits'].apply(self._format_credits)
+        table_agg['Total Pages'] = table_agg['Total Pages'].astype(int)
+        table_agg['Total Documents'] = table_agg['Total Documents'].astype(int)
+        table_agg['First Usage'] = pd.to_datetime(table_agg['First Usage']).dt.strftime('%Y-%m-%d')
+        table_agg['Last Usage'] = pd.to_datetime(table_agg['Last Usage']).dt.strftime('%Y-%m-%d')
+        table_agg['Date Range'] = table_agg['First Usage'] + ' to ' + table_agg['Last Usage']
+        
+        # Display table
+        display_cols = ['Operation Name', 'Total Credits', 'Total Pages', 'Total Documents', 'Date Range']
+        st.dataframe(
+            table_agg[display_cols],
+            use_container_width=True,
+            hide_index=True,
+            height=400
+        )
+    
+    def _get_fine_tuning_data(self) -> Optional[pd.DataFrame]:
+        """
+        Retrieve Fine-Tuning usage data from CORTEX_FINE_TUNING_USAGE_HISTORY.
+        
+        Queries SNOWFLAKE.ACCOUNT_USAGE.CORTEX_FINE_TUNING_USAGE_HISTORY to get
+        model fine-tuning usage with details on models and token credits.
+        
+        Test Query:
+        SELECT 
+            MODEL_NAME,
+            TOKEN_CREDITS,
+            START_TIME,
+            END_TIME
+        FROM SNOWFLAKE.ACCOUNT_USAGE.CORTEX_FINE_TUNING_USAGE_HISTORY
+        WHERE START_TIME >= DATEADD('month', -12, CURRENT_DATE())
+        ORDER BY START_TIME DESC;
+        
+        Returns:
+            Optional[pd.DataFrame]: DataFrame with columns MODEL_NAME, TOKEN_CREDITS,
+                                   START_TIME, END_TIME,
+                                   or None if query fails or no data exists
+        """
+        query = """
+        SELECT 
+            MODEL_NAME,
+            TOKEN_CREDITS,
+            START_TIME,
+            END_TIME
+        FROM SNOWFLAKE.ACCOUNT_USAGE.CORTEX_FINE_TUNING_USAGE_HISTORY
+        WHERE START_TIME >= DATEADD('month', -12, CURRENT_DATE())
+        ORDER BY START_TIME DESC
+        """
+        
+        try:
+            data = self.data_manager.execute_query(query)
+            
+            if data is None or data.empty:
+                return None
+            
+            # Handle NULL token_credits (convert to 0)
+            if 'TOKEN_CREDITS' in data.columns:
+                data['TOKEN_CREDITS'] = data['TOKEN_CREDITS'].fillna(0)
+            
+            # Handle timezone normalization for timestamp columns
+            if 'START_TIME' in data.columns:
+                data['START_TIME'] = pd.to_datetime(data['START_TIME']).dt.tz_localize(None)
+            
+            if 'END_TIME' in data.columns:
+                data['END_TIME'] = pd.to_datetime(data['END_TIME']).dt.tz_localize(None)
+            
+            return data
+            
+        except Exception as e:
+            # View may not exist in some accounts
+            st.warning(f"Fine-Tuning data not available: {str(e)}")
+            return None
+    
+    def _render_fine_tuning_section(self, data: pd.DataFrame) -> None:
+        """
+        Render Fine-Tuning section with metrics, chart, and data table.
+        
+        Displays:
+        - Section header with date range
+        - Two key metrics: Total Credits, Unique Model Count
+        - Horizontal bar chart: Credits by Model Name
+        - Sortable data table with aggregated details
+        
+        Args:
+            data: DataFrame with columns MODEL_NAME, TOKEN_CREDITS, START_TIME, END_TIME
+        """
+        # Section header
+        st.markdown("---")
+        st.markdown("#### 🎯 Fine-Tuning")
+        
+        # Display date range
+        if not data.empty and 'START_TIME' in data.columns:
+            min_date = data['START_TIME'].min()
+            max_date = data['START_TIME'].max()
+            st.caption(f"Data from {min_date.strftime('%Y-%m-%d')} to {max_date.strftime('%Y-%m-%d')}")
+        
+        # Calculate metrics
+        total_credits = data['TOKEN_CREDITS'].sum()
+        unique_models = data['MODEL_NAME'].nunique()
+        
+        # Display metrics
+        col1, col2 = st.columns(2)
+        with col1:
+            st.metric("Total Credits", self._format_credits(total_credits))
+        with col2:
+            st.metric("Unique Models", f"{unique_models}")
+        
+        # Aggregate by model name
+        model_agg = data.groupby('MODEL_NAME').agg({
+            'TOKEN_CREDITS': 'sum'
+        }).reset_index().sort_values('TOKEN_CREDITS', ascending=True)
+        
+        # Bar chart - Credits by Model Name
+        st.markdown("##### Credits by Model Name")
+        fig = go.Figure()
+        fig.add_trace(go.Bar(
+            y=model_agg['MODEL_NAME'],
+            x=model_agg['TOKEN_CREDITS'],
+            orientation='h',
+            marker=dict(color='#e377c2')
+        ))
+        
+        fig.update_layout(
+            xaxis_title="Credits",
+            yaxis_title="Model Name",
+            height=max(300, len(model_agg) * 30),
+            showlegend=False,
+            margin=dict(l=0, r=0, t=10, b=0)
+        )
+        
+        st.plotly_chart(fig, use_container_width=True)
+        
+        # Data table - Aggregated by Model
+        st.markdown("##### Fine-Tuning Usage Details")
+        
+        # Aggregate for table
+        table_agg = data.groupby('MODEL_NAME').agg({
+            'TOKEN_CREDITS': 'sum',
+            'START_TIME': ['min', 'max']
+        }).reset_index()
+        
+        # Flatten column names
+        table_agg.columns = ['Model Name', 'Total Credits', 'First Usage', 'Last Usage']
+        
+        # Format columns
+        table_agg['Total Credits'] = table_agg['Total Credits'].apply(self._format_credits)
+        table_agg['First Usage'] = pd.to_datetime(table_agg['First Usage']).dt.strftime('%Y-%m-%d')
+        table_agg['Last Usage'] = pd.to_datetime(table_agg['Last Usage']).dt.strftime('%Y-%m-%d')
+        table_agg['Date Range'] = table_agg['First Usage'] + ' to ' + table_agg['Last Usage']
+        
+        # Add usage count
+        usage_counts = data.groupby('MODEL_NAME').size().reset_index(name='Usage Count')
+        table_agg = table_agg.merge(
+            usage_counts,
+            left_on='Model Name',
+            right_on='MODEL_NAME',
+            how='left'
+        )
+        
+        # Display table
+        display_cols = ['Model Name', 'Total Credits', 'Usage Count', 'Date Range']
+        st.dataframe(
+            table_agg[display_cols],
+            use_container_width=True,
+            hide_index=True,
+            height=400
+        )
+    
+    def _format_credits(self, credits: float) -> str:
+        """
+        Format credit values consistently with 2 decimal places.
+        
+        Args:
+            credits: Credit value to format
+            
+        Returns:
+            Formatted credit string (e.g., "1,234.56")
+        """
+        if pd.isna(credits) or credits is None:
+            return "0.00"
+        return f"{credits:,.2f}"
+    
+    def _handle_no_data(self, service_name: str) -> None:
+        """
+        Display user-friendly message when no data is available for a service.
+        
+        Args:
+            service_name: Name of the service with no data
+        """
+        st.info(f"ℹ️ No {service_name} usage found in the last 12 months.")
+
+
+# Removed: ComprehensiveAIServicesAnalyzer class (replaced by AIServicesAnalyzer above)
 
 
 class DataAccessManager:
@@ -6451,9 +6886,9 @@ class SnowflakeUsageDashboard:
         self._serverless_analyzer.render_analysis()
     
     def render_ai_services_tab(self):
-        """Render the comprehensive AI Services analysis tab."""
+        """Render the AI Services analysis tab with simplified, accurate cost tracking."""
         if not hasattr(self, '_ai_services_analyzer'):
-            self._ai_services_analyzer = ComprehensiveAIServicesAnalyzer(self.data_manager)
+            self._ai_services_analyzer = AIServicesAnalyzer(self.data_manager)
         
         self._ai_services_analyzer.render_analysis()
     
