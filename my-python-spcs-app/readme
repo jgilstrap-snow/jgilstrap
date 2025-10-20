@@ -1,0 +1,4 @@
+snow spcs service suspend my_python_service --role SPCS_ROLE --database SPCS_DB --schema SPCS_SCHEMA
+
+
+snow spcs service resume my_python_service --role SPCS_ROLE --database SPCS_DB --schema SPCS_SCHEMA

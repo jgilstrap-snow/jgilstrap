@@ -1,0 +1,17 @@
+spec:
+  containers:
+  - name: my-python-app
+    image: /spcs_db/spcs_schema/my_image_repo/my-python-app:latest
+    env:
+      PORT: 8080
+    resources:
+      requests:
+        memory: 1Gi
+        cpu: 0.5
+      limits:
+        memory: 1Gi
+        cpu: 0.5
+  endpoints:
+  - name: app-endpoint
+    port: 8080
+    public: true

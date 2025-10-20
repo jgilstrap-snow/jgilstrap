@@ -1,0 +1,17 @@
+definition_version: 2
+entities:
+  my_python_service:
+    type: service
+    identifier: my_python_service
+    stage: my_stage
+    compute_pool: my_compute_pool
+    spec_file: service_spec.yaml
+    min_instances: 1
+    max_instances: 1
+    query_warehouse: compute_wh
+    auto_resume: true
+    artifacts:
+      - service_spec.yaml
+      - Dockerfile
+      - app.py
+      - requirements.txt
